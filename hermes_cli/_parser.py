@@ -213,6 +213,13 @@ def build_top_level_parser():
     )
     _inherited_flag(
         parser,
+        "--remote",
+        "-R",
+        default=argparse.SUPPRESS,
+        help="Remote Hermes server URL (e.g. http://host:9119). Delegates all agent work to a remote API server.",
+    )
+    _inherited_flag(
+        parser,
         "--tui",
         action="store_true",
         default=False,
@@ -376,6 +383,18 @@ def build_top_level_parser():
         action="store_true",
         default=False,
         help="With --tui: run TypeScript sources via tsx (skip dist build)",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--remote",
+        "-R",
+        default=argparse.SUPPRESS,
+        help="Remote Hermes server URL (e.g. http://host:9119). Delegates all agent work to a remote API server instead of running locally.",
+    )
+    chat_parser.add_argument(
+        "--remote-key",
+        default=None,
+        help="API key for the remote Hermes server (passed as Bearer token in Authorization header).",
     )
 
     return parser, subparsers, chat_parser

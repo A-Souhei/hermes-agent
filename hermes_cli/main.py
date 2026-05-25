@@ -1793,6 +1793,8 @@ def cmd_chat(args):
         "pass_session_id": getattr(args, "pass_session_id", False),
         "max_turns": getattr(args, "max_turns", None),
         "ignore_rules": getattr(args, "ignore_rules", False),
+        "remote_url": getattr(args, "remote", None),
+        "remote_key": getattr(args, "remote_key", None),
         "ignore_user_config": getattr(args, "ignore_user_config", False),
         "compact": getattr(args, "compact", False),
     }
