@@ -10,6 +10,7 @@ The remote API server is the same endpoint served by `gateway/platforms/api_serv
 
 import json
 import logging
+import urllib.parse
 import uuid
 from typing import Any, Callable, Dict, List, Optional
 
@@ -25,6 +26,7 @@ class RemoteAgent:
 
     Args:
         remote_url: Full URL of the remote API server (e.g. ``http://localhost:9119``).
+            Must use ``http`` or ``https`` scheme.
         api_key: Optional Bearer token sent in the ``Authorization`` header.
         session_id: Session identifier sent via ``X-Hermes-Session-Id``.  Auto-generated
             UUID if ``None``.
@@ -47,6 +49,7 @@ class RemoteAgent:
     _clarify_callback: Optional[Callable[..., Any]]
     _print_fn: Optional[Callable[[str], Any]]
     _quiet_mode: bool
+    _interrupted: bool
 
     # ------------------------------------------------------------------
     def __init__(
@@ -61,7 +64,13 @@ class RemoteAgent:
         print_fn: Optional[Callable[[str], Any]] = None,
         quiet_mode: bool = False,
     ) -> None:
-        self._remote_url = remote_url or "http://localhost:9119"
+        url = remote_url or "http://localhost:9119"
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(
+                f"remote_url must use http or https scheme, got: {url!r}"
+            )
+        self._remote_url = url
         self._api_key = api_key
         self._session_id = session_id or uuid.uuid4().hex
         self._tool_progress_callback = tool_progress_callback
@@ -70,7 +79,8 @@ class RemoteAgent:
         self._clarify_callback = clarify_callback
         self._print_fn = print_fn
         self._quiet_mode = quiet_mode
-        self._client: Optional[httpx.Client] = None
+        self._interrupted = False
+        self._client: Optional[httpx.Client] = httpx.Client(timeout=_HTTPX_TIMEOUT)
 
     @property
     def session_id(self) -> str:
@@ -78,12 +88,21 @@ class RemoteAgent:
         return self._session_id
 
     def interrupt(self) -> None:
-        """No-op interrupt — matches AIAgent interface.
+        """Abort any in-flight stream by closing the underlying HTTP client.
 
-        The remote server owns the execution context; the client cannot
-        interrupt a running stream directly.  Placeholder for interface
-        compatibility with the CLI's cleanup paths.
+        Sets ``_interrupted`` so the exception handler in ``run_conversation``
+        can distinguish a user-initiated abort from a real network error.
         """
+        self._interrupted = True
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+
+    def close(self) -> None:
+        """Release the underlying HTTP client.  Safe to call multiple times."""
+        if self._client is not None:
+            self._client.close()
+            self._client = None
 
     # ------------------------------------------------------------------
     def chat(self, message: str, stream_callback: Optional[Callable[[str], Any]] = None) -> str:
@@ -107,7 +126,7 @@ class RemoteAgent:
         conversation_history: Optional[List[Dict[str, Any]]] = None,
         task_id: Optional[str] = None,
         stream_callback: Optional[Callable[[str], Any]] = None,
-        persist_user_message: Optional[str] = None,
+        persist_user_message: Optional[str] = None,  # not forwarded; server manages persistence
     ) -> Dict[str, Any]:
         """Full interface — send messages and stream the response.
 
@@ -124,6 +143,12 @@ class RemoteAgent:
         Returns:
             A dict with ``final_response``, ``messages``, ``api_calls``, and ``tools``.
         """
+        self._interrupted = False
+
+        # Re-create client if it was closed by a previous interrupt()
+        if self._client is None:
+            self._client = httpx.Client(timeout=_HTTPX_TIMEOUT)
+
         # -- build messages ---------------------------------------------------
         messages: List[Dict[str, Any]] = []
         if system_message:
@@ -150,111 +175,117 @@ class RemoteAgent:
 
         # -- send request & stream --------------------------------------------
         try:
-            if self._client is None:
-                self._client = httpx.Client(timeout=_HTTPX_TIMEOUT)
             with self._client.stream(
-                    "POST",
-                    f"{self._remote_url.rstrip('/')}/v1/chat/completions",
-                    headers=headers,
-                    json=payload,
-                ) as response:
-                    if response.status_code != 200:
+                "POST",
+                f"{self._remote_url.rstrip('/')}/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            ) as response:
+                if response.status_code != 200:
+                    try:
+                        error_body = response.read().decode(errors="replace")
                         try:
-                            error_body = response.read().decode(errors="replace")
-                            try:
-                                error_detail = json.loads(error_body).get("error", {}).get("message", error_body[:200])
-                            except json.JSONDecodeError:
-                                error_detail = error_body[:200]
-                        except Exception:
-                            error_detail = "(no body)"
-                        logger.warning(
-                            "Remote agent returned HTTP %d from %s: %s",
-                            response.status_code, self._remote_url, error_detail,
-                        )
-                        return {
-                            "final_response": (
-                                f"Remote agent returned HTTP {response.status_code} "
-                                f"from {self._remote_url}"
-                            ),
-                            "messages": [],
-                            "api_calls": 0,
-                            "tools": [],
-                        }
+                            error_detail = json.loads(error_body).get("error", {}).get("message", error_body[:200])
+                        except json.JSONDecodeError:
+                            error_detail = error_body[:200]
+                    except Exception:
+                        error_detail = "(no body)"
+                    logger.warning(
+                        "Remote agent returned HTTP %d from %s: %s",
+                        response.status_code, self._remote_url, error_detail,
+                    )
+                    return {
+                        "final_response": (
+                            f"Remote agent returned HTTP {response.status_code} "
+                            f"from {self._remote_url}"
+                        ),
+                        "messages": [],
+                        "api_calls": 0,
+                        "tools": [],
+                    }
 
-                    content_type = response.headers.get("content-type", "")
-                    if "text/event-stream" not in content_type:
-                        logger.warning(
-                            "Remote agent returned non-SSE content-type: %s",
-                            content_type,
-                        )
+                content_type = response.headers.get("content-type", "")
+                if "text/event-stream" not in content_type:
+                    logger.warning(
+                        "Remote agent returned non-SSE content-type: %s",
+                        content_type,
+                    )
+                    return {
+                        "final_response": (
+                            f"Remote agent returned unexpected content-type '{content_type}' "
+                            f"from {self._remote_url}"
+                        ),
+                        "messages": [],
+                        "api_calls": 0,
+                        "tools": [],
+                    }
 
-                    current_event: Optional[str] = None
+                current_event: Optional[str] = None
 
-                    for line in response.iter_lines():
-                        # -- blank line ---------------------------------------
-                        if not line:
+                for line in response.iter_lines():
+                    # -- blank line -------------------------------------------
+                    if not line:
+                        current_event = None
+                        continue
+
+                    # -- keepalive comment ------------------------------------
+                    if line.startswith(":"):
+                        continue
+
+                    # -- event: line ------------------------------------------
+                    if line.startswith("event: "):
+                        current_event = line[len("event: "):].strip()
+                        continue
+
+                    # -- data: line -------------------------------------------
+                    if line.startswith("data: "):
+                        data_str = line[len("data: "):]
+
+                        # Stream end marker
+                        if data_str == "[DONE]":
+                            current_event = None
+                            break
+
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            if current_event == "hermes.tool.progress":
+                                logger.debug("Skipping malformed tool progress data")
                             current_event = None
                             continue
 
-                        # -- keepalive comment --------------------------------
-                        if line.startswith(":"):
+                        # -- tool progress event ------------------------------
+                        if current_event == "hermes.tool.progress":
+                            _handle_tool_progress(
+                                data,
+                                self._tool_progress_callback,
+                                self._stream_delta_callback,
+                            )
+                            current_event = None
                             continue
 
-                        # -- event: line --------------------------------------
-                        if line.startswith("event: "):
-                            current_event = line[len("event: "):].strip()
+                        # -- normal chat completion delta ---------------------
+                        current_event = None  # reset after consuming
+
+                        choices = data.get("choices", [])
+                        if not choices:
                             continue
 
-                        # -- data: line ---------------------------------------
-                        if line.startswith("data: "):
-                            data_str = line[len("data: "):]
+                        delta = choices[0].get("delta", {})
+                        # Skip role-only deltas (e.g. {"role": "assistant"})
+                        if "content" not in delta:
+                            continue
 
-                            # Stream end marker
-                            if data_str == "[DONE]":
-                                current_event = None
-                                break
+                        content = delta.get("content")
+                        if not content:
+                            continue
 
-                            try:
-                                data = json.loads(data_str)
-                            except json.JSONDecodeError:
-                                if current_event == "hermes.tool.progress":
-                                    logger.debug("Skipping malformed tool progress data")
-                                    continue
-                                current_event = None
-                                continue
+                        full_response += content
 
-                            # -- tool progress event -------------------------
-                            if current_event == "hermes.tool.progress":
-                                _handle_tool_progress(
-                                    data,
-                                    self._tool_progress_callback,
-                                    self._stream_delta_callback,
-                                )
-                                current_event = None
-                                continue
-
-                            # -- normal chat completion delta -----------------
-                            current_event = None  # reset after consuming
-
-                            choices = data.get("choices", [])
-                            if not choices:
-                                continue
-
-                            delta = choices[0].get("delta", {})
-                            # Skip role-only deltas (e.g. {"role": "assistant"})
-                            if "content" not in delta:
-                                continue
-
-                            content = delta.get("content")
-                            if not content:
-                                continue
-
-                            full_response += content
-
-                            if self._stream_delta_callback:
-                                self._stream_delta_callback(content)
-                            if stream_callback:
-                                stream_callback(content)
+                        if self._stream_delta_callback:
+                            self._stream_delta_callback(content)
+                        if stream_callback:
+                            stream_callback(content)
 
         except httpx.ConnectError as exc:
             logger.warning("Failed to connect to remote agent at %s: %s", self._remote_url, exc)
@@ -264,9 +295,8 @@ class RemoteAgent:
                 "api_calls": 0,
                 "tools": [],
             }
-        except Exception as exc:
-            logger.warning("Error during remote agent streaming: %s", exc)
-            # Return whatever was accumulated so far
+        except httpx.TimeoutException as exc:
+            logger.warning("Remote agent request timed out at %s: %s", self._remote_url, exc)
             if full_response:
                 result_messages = list(messages)
                 result_messages.append({"role": "assistant", "content": full_response})
@@ -277,9 +307,62 @@ class RemoteAgent:
                     "tools": [],
                 }
             return {
-                "final_response": (
-                    f"Error connecting to remote agent at {self._remote_url}"
-                ),
+                "final_response": f"Remote agent request timed out at {self._remote_url}",
+                "messages": [],
+                "api_calls": 0,
+                "tools": [],
+            }
+        except (httpx.ReadError, httpx.RemoteProtocolError) as exc:
+            if self._interrupted:
+                # User-initiated abort — return whatever was accumulated so far
+                result_messages = list(messages)
+                if full_response:
+                    result_messages.append({"role": "assistant", "content": full_response})
+                return {
+                    "final_response": full_response,
+                    "messages": result_messages,
+                    "api_calls": 1 if full_response else 0,
+                    "tools": [],
+                }
+            logger.warning("Remote agent stream error at %s: %s", self._remote_url, exc)
+            if full_response:
+                result_messages = list(messages)
+                result_messages.append({"role": "assistant", "content": full_response})
+                return {
+                    "final_response": full_response,
+                    "messages": result_messages,
+                    "api_calls": 1,
+                    "tools": [],
+                }
+            return {
+                "final_response": f"Error connecting to remote agent at {self._remote_url}",
+                "messages": [],
+                "api_calls": 0,
+                "tools": [],
+            }
+        except Exception as exc:
+            if self._interrupted:
+                result_messages = list(messages)
+                if full_response:
+                    result_messages.append({"role": "assistant", "content": full_response})
+                return {
+                    "final_response": full_response,
+                    "messages": result_messages,
+                    "api_calls": 1 if full_response else 0,
+                    "tools": [],
+                }
+            logger.exception("Unexpected error during remote agent streaming: %s", exc)
+            if full_response:
+                result_messages = list(messages)
+                result_messages.append({"role": "assistant", "content": full_response})
+                return {
+                    "final_response": full_response,
+                    "messages": result_messages,
+                    "api_calls": 1,
+                    "tools": [],
+                }
+            return {
+                "final_response": f"Error connecting to remote agent at {self._remote_url}",
                 "messages": [],
                 "api_calls": 0,
                 "tools": [],

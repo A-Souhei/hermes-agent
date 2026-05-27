@@ -2818,8 +2818,8 @@ class HermesCLI:
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
-        remote_url: str = None,
-        remote_key: str = None,
+        remote_url: Optional[str] = None,
+        remote_key: Optional[str] = None,
     ):
         """
         Initialize the Hermes CLI.
@@ -14624,8 +14624,8 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
-    remote_url: str = None,
-    remote_key: str = None,
+    remote_url: Optional[str] = None,
+    remote_key: Optional[str] = None,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant

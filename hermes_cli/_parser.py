@@ -213,13 +213,6 @@ def build_top_level_parser():
     )
     _inherited_flag(
         parser,
-        "--remote",
-        "-R",
-        default=argparse.SUPPRESS,
-        help="Remote Hermes server URL (e.g. http://host:9119). Delegates all agent work to a remote API server.",
-    )
-    _inherited_flag(
-        parser,
         "--tui",
         action="store_true",
         default=False,
