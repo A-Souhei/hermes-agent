@@ -2818,6 +2818,8 @@ class HermesCLI:
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
+        remote_url: Optional[str] = None,
+        remote_key: Optional[str] = None,
     ):
         """
         Initialize the Hermes CLI.
@@ -3009,6 +3011,8 @@ class HermesCLI:
         # pass skip_context_files=True and skip_memory=True to AIAgent so
         # AGENTS.md/SOUL.md/.cursorrules and persistent memory are not loaded.
         self.ignore_rules = ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"
+        self.remote_url = remote_url
+        self.remote_key = remote_key
         
         # Ephemeral system prompt: env var takes precedence, then config
         self.system_prompt = (
@@ -4735,6 +4739,37 @@ class HermesCLI:
         if self.agent is not None:
             return True
 
+        # --remote mode: delegate to RemoteAgent instead of local AIAgent
+        if self.remote_url:
+            self._install_tool_callbacks()
+            try:
+                from agent.remote_agent import RemoteAgent
+            except ImportError as exc:
+                _cprint(f"  [bold red]Error:[/] could not import RemoteAgent: {exc}")
+                return False
+            self.agent = RemoteAgent(
+                remote_url=self.remote_url,
+                api_key=self.remote_key,
+                session_id=self.session_id,
+                tool_progress_callback=self._on_tool_progress,
+                stream_delta_callback=self._stream_delta if self.streaming_enabled else None,
+                thinking_callback=self._on_thinking,
+                clarify_callback=self._clarify_callback,
+                print_fn=_cprint,
+                quiet_mode=not self.verbose,
+            )
+            # Pin local config to match remote signature so agent isn't rebuilt per turn
+            self.model = "remote"
+            self.provider = "remote"
+            self.base_url = self.remote_url
+            # Store reference for atexit memory provider shutdown
+            global _active_agent_ref
+            _active_agent_ref = self.agent
+            self._active_agent_route_signature = (
+                "remote", "remote", self.remote_url, None, None, (),
+            )
+            return True
+
         _prepare_deferred_agent_startup()
         self._install_tool_callbacks()
         self._ensure_tirith_security()
@@ -4891,7 +4926,6 @@ class HermesCLI:
                 tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
             )
             # Store reference for atexit memory provider shutdown
-            global _active_agent_ref
             _active_agent_ref = self.agent
             # Route agent status output through prompt_toolkit so ANSI escape
             # sequences aren't garbled by patch_stdout's StdoutProxy (#2262).
@@ -14590,6 +14624,8 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    remote_url: Optional[str] = None,
+    remote_key: Optional[str] = None,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -14709,6 +14745,8 @@ def main(
         checkpoints=checkpoints,
         pass_session_id=pass_session_id,
         ignore_rules=ignore_rules,
+        remote_url=remote_url,
+        remote_key=remote_key,
     )
 
     if parsed_skills:
